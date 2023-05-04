@@ -1,0 +1,203 @@
+import java.text.SimpleDateFormat
+def selectTag
+def releaseTag
+def tag
+def tags
+def nexusUser
+def nexusPassword
+def repository
+pipeline {
+ agent {
+        kubernetes {
+        cloud 'openshift'
+        yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins
+  containers:
+  - name: jnlp
+    image: quay.io/openshift/origin-jenkins-agent-base:latest
+    command:
+    args: ['\${computer.jnlpmac}', '\${computer.name}']
+    workingDir: /tmp
+    tty: false
+  - name: tools
+    image: quay.io/voravitl/tools:jenkins
+    command:
+    - cat
+    tty: true
+    resources:
+      requests:
+        memory: 128Mi
+        cpu: 100m
+"""
+  }
+ }
+  options {
+    // set a timeout of 20 minutes for this pipeline
+    timeout(time: 20, unit: 'MINUTES')
+  }
+  environment {
+    imageName="backend"
+    nexusUser = ""
+    nexusPassword =""
+    nexusContainerRepo = "docker"
+  }
+  stages {
+    stage('Initial Configuration') {
+      steps {
+        script {
+          nexusUser = sh (
+              script: 'oc get secret ${NEXUS_SECRET} -o jsonpath="{.data.username}"| base64 -d -',
+              returnStdout: true
+            ).trim()
+          nexusPassword = sh (
+              script: 'oc get secret ${NEXUS_SECRET} -o jsonpath="{.data.password}"| base64 -d -',
+              returnStdout: true
+            ).trim()
+          def nexusCreds = 'nexus_host = "'+env.NEXUS_SVC+'"\nnexus_repository = "'+nexusContainerRepo+'"\n'+'nexus_username = "'+nexusUser+'"\n'+'nexus_password = "'+nexusPassword+'"\n'
+          writeFile file: ".credentials", text: nexusCreds
+        }
+      }
+    }
+    stage('Choose UAT Version') {
+      steps {
+        script {
+           if(env.USE_INTERNAL_REGISTRY.toBoolean()){
+              println "OpenShift internal registry"
+              openshift.withCluster() {
+                namespace = openshift.project()
+                tags = openshift.selector("istag")
+                  .objects()
+                  .collect {
+                  it.metadata.name
+                }
+                .findAll {
+                  it ==~ /^backend:([0-9]+)\.([0-9]+)\.([0-9]+)\-([0-9]+)\-(.*)$/
+                  //it.startsWith 'backend:([0-9]+)\.([0-9]+)\.([0-9]+)\-([0-9]+)'
+                }
+                .collect {
+                  it.replaceAll(/backend:(.*)/, "\$1")
+                }
+                .sort()
+              timeout(5) {
+                selectTag = input(
+                  ok: "Deploy UAT",
+                  message: "Enter release version to promote to UAT",
+                  parameters: [
+                    choice(
+                      choices: tags.join('\n'),
+                      description: '',
+                      name: 'Select Version'
+                    )
+                  ]
+                )
+              }
+            }
+           } else {
+             container("tools") {
+              println "Nexus Registry"
+              tags = sh (
+                script: 'nexus-cli image tags --name backend | grep -E "^([0-9]+).([0-9]+).([0-9]+)-([0-9]+)-(.*)$"',
+                returnStdout: true
+              )
+              timeout(5) {
+                selectTag = input(
+                  ok: "Deploy UAT",
+                  message: "Enter release version to promote to UAT",
+                  parameters: [
+                    choice(
+                      choices: tags,
+                      description: '',
+                      name: 'Select Version'
+                    )
+                  ]
+                )
+              }
+             }
+           }
+
+          println "selectTag = ${selectTag}"
+          version = selectTag.split('-')[0]
+          println "version = ${version}"
+        }
+      }
+    }
+    stage('Tear-Down UAT') {
+      steps {
+        script {
+          openshift.withCluster() {
+            openshift.withProject(env.UAT_PROJECT) {
+              println "Tear-Down project ${env.UAT_PROJECT}"
+              openshift.raw("delete all -l app=${imageName}")
+            }
+          }
+        }
+      }
+    }
+    // Create Service
+    stage('Create Service') {
+      steps {
+        script {
+          openshift.withCluster() {
+            openshift.withProject(env.UAT_PROJECT) {
+              def template = './manifests/backend-svc-uat.yaml'
+              openshift.apply(
+                openshift.process("-f", template)
+              )
+            }
+          }
+        }
+      }
+    }
+    // Create Route
+    stage('Create Route') {
+      steps {
+        script {
+          openshift.withCluster() {
+            openshift.withProject(env.UAT_PROJECT) {
+              def template = './manifests/backend-route-uat.yaml'
+              openshift.apply(
+                openshift.process("-f", template)
+              )
+            }
+          }
+        }
+      }
+    }
+    // Create Deployment Config
+    stage('Create Deployment') {
+      steps {
+        script {
+          println "Deploy to: env.UAT_PROJECT"
+          println "IMAGE_TAG = ${selectTag}"
+          if(env.USE_INTERNAL_REGISTRY.toBoolean()){
+            repository = "image-registry.openshift-image-registry.svc:5000/ci-cd"
+          } else {
+             repository =  sh (
+              script: 'oc get route nexus-registry -n ci-cd -o jsonpath="{.spec.host}"',
+              returnStdout: true
+            ).trim()
+          }
+          println "Set image repository to ${repository}"
+          openshift.withCluster() {
+            openshift.withProject(env.UAT_PROJECT) {
+              def template = './manifests/backend-deployment-uat.yaml'
+                openshift.apply(
+                    openshift.process(
+                      "-f", template,
+                      "-p", "REPOSITORY=${repository}",
+                      "-p", "IMAGE_NAME=${imageName}",
+                      "-p", "IMAGE_TAG=${selectTag}",
+                      "-p", "BACKEND_URL=${env.BACKEND_URL}",
+                      "-p", "APP_VERSION=${version}"
+                    )
+                  )             
+            }
+          }
+        }
+      }
+    }
+   }
+}
